@@ -1,0 +1,13 @@
+# Skip large data/model folders
+Features/
+Models/
+
+# Python
+__pycache__/
+*.pyc
+*.pth
+*.pkl
+.env
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
