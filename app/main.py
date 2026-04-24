@@ -49,7 +49,11 @@ def get_machines():
 
 @app.post("/score_auto")
 async def score_audio_auto(file: UploadFile = File(...)):
-    """Auto-detect machine type and score."""
+    """
+    Auto-detect machine type by running ALL 7 models.
+    The machine whose autoencoder gives the LOWEST anomaly score
+    is selected — this is more reliable than the classifier alone.
+    """
     if not file.filename.lower().endswith(".wav"):
         raise HTTPException(status_code=400, detail="Only .wav files accepted.")
 
@@ -59,24 +63,35 @@ async def score_audio_auto(file: UploadFile = File(...)):
         with open(tmp_path, "wb") as f:
             f.write(content)
 
-        # Run one model just to get classifier output
-        result = predict_single(
-            tmp_path, MACHINE_TYPES[0], mt_models, REFERENCE_STATS, THRESHOLD
-        )
-        # Pick machine type with highest classifier confidence
-        clf = result["classifier_output"]
-        best_mt = max(clf, key=clf.get)
+        # Run ALL 7 models and collect scores
+        all_scores  = {}
+        all_results = {}
+        for mt in MACHINE_TYPES:
+            r = predict_single(
+                tmp_path, mt, mt_models, REFERENCE_STATS, THRESHOLD
+            )
+            all_scores[mt]  = r["anomaly_score"]
+            all_results[mt] = r
 
-        # Re-run with the detected machine type
-        final_result = predict_single(
-            tmp_path, best_mt, mt_models, REFERENCE_STATS, THRESHOLD
-        )
+        # Best machine = lowest anomaly score
+        # (its autoencoder reconstructs the sound most accurately)
+        best_mt      = min(all_scores, key=all_scores.get)
+        final_result = all_results[best_mt]
+
+        # Attach all scores for transparency in UI
+        final_result["all_machine_scores"]   = {
+            mt: round(float(s), 4) for mt, s in all_scores.items()
+        }
+        final_result["auto_detected_machine"] = best_mt
+
         return JSONResponse(content=final_result)
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
 
 @app.post("/score")
 async def score_audio(
@@ -94,12 +109,13 @@ async def score_audio(
             f.write(content)
 
         if not machine_type or machine_type not in MACHINE_TYPES:
-            # Auto-detect
-            result = predict_single(
-                tmp_path, MACHINE_TYPES[0], mt_models, REFERENCE_STATS, THRESHOLD
-            )
-            clf    = result["classifier_output"]
-            machine_type = max(clf, key=clf.get)
+            all_scores = {}
+            for mt in MACHINE_TYPES:
+                r = predict_single(
+                    tmp_path, mt, mt_models, REFERENCE_STATS, THRESHOLD
+                )
+                all_scores[mt] = r["anomaly_score"]
+            machine_type = min(all_scores, key=all_scores.get)
 
         result = predict_single(
             tmp_path, machine_type, mt_models, REFERENCE_STATS, THRESHOLD
@@ -113,7 +129,7 @@ async def score_audio(
 
 
 # ==============================================================================
-# Gradio UI — No dropdown, fully automatic
+# Gradio UI
 # ==============================================================================
 def analyze(wav_file):
     if wav_file is None:
@@ -130,14 +146,14 @@ def analyze(wav_file):
             err = response.json().get("detail", "Unknown error")
             return f"❌ {err}", "", "", ""
 
-        r = response.json()
+        r       = response.json()
+        best_mt = r["auto_detected_machine"]
+        score   = r["anomaly_score"]
+        thresh  = r["threshold"]
+        gap     = score - thresh
+        status  = "🔴  ANOMALY DETECTED" if r["is_anomaly"] else "🟢  MACHINE IS NORMAL"
 
         # ── Panel 1: Detection ─────────────────────────────────────────
-        status = "🔴  ANOMALY DETECTED" if r["is_anomaly"] else "🟢  MACHINE IS NORMAL"
-        score  = r["anomaly_score"]
-        thresh = r["threshold"]
-        gap    = score - thresh
-
         detection = f"""{status}
 {"="*40}
 Anomaly Score : {score:.4f}
@@ -149,22 +165,21 @@ Raw MSE       : {r["raw_mse"]:.6f}
 """
 
         # ── Panel 2: Machine Recognition ───────────────────────────────
-        clf     = r["classifier_output"]
-        top_mt  = max(clf, key=clf.get)
-        top_pct = clf[top_mt] * 100
-
-        clf_lines = "\n".join([
-            f"  {'►' if mt == top_mt else ' '} {mt:<12} {prob*100:5.1f}%"
-            for mt, prob in sorted(clf.items(), key=lambda x: -x[1])
+        # Show all 7 reconstruction scores — lower = better match
+        all_scores = r.get("all_machine_scores", {})
+        score_lines = "\n".join([
+            f"  {'►' if mt == best_mt else ' '} {mt:<12} score: {s:+.4f}"
+            for mt, s in sorted(all_scores.items(), key=lambda x: x[1])
         ])
 
-        recognition = f"""🤖  IDENTIFIED MACHINE
+        recognition = f"""🤖  AUTO-DETECTED MACHINE
 {"="*40}
-  Machine    : {top_mt}
-  Confidence : {top_pct:.1f}%
+  Detected As : {best_mt}
+  Method      : Lowest reconstruction error
+                (lower score = better match)
 
-All Probabilities:
-{clf_lines}
+All machine scores:
+{score_lines}
 """
 
         # ── Panel 3: Explanation ───────────────────────────────────────
@@ -205,15 +220,15 @@ No action required.
         # ── Panel 4: Summary ───────────────────────────────────────────
         summary = f"""📋  FULL SUMMARY
 {"="*40}
-Auto-Detected  : {top_mt} ({top_pct:.1f}%)
+Auto-Detected  : {best_mt}
 Status         : {"ANOMALY ⚠️" if r["is_anomaly"] else "NORMAL ✅"}
 Score          : {score:.4f} / {thresh:.4f}
 
 Detection:
   {"⚠️  ANOMALY — inspect machine" if r["is_anomaly"] else "✅ Normal operation"}
 
-Recognition:
-  {"Confident" if top_pct > 90 else "Uncertain"} about machine type
+All machine scores (lower = better match):
+{score_lines}
 
 Problem frequencies:
   {freqs} Hz
@@ -252,7 +267,9 @@ with gr.Blocks(title="Acoustic Anomaly Detection", theme=gr.themes.Soft()) as de
             **How it works:**
             1. Upload a 10-second WAV file
             2. Click **Analyze Audio**
-            3. The system auto-detects the machine type!
+            3. System runs all 7 models automatically
+            4. Best matching model is selected
+            5. Anomaly decision is made
 
             **Threshold:** `{THRESHOLD:.4f}`
             - Score **above** → ⚠️ Anomaly
@@ -282,7 +299,7 @@ with gr.Blocks(title="Acoustic Anomaly Detection", theme=gr.themes.Soft()) as de
 
     analyze_btn.click(
         fn=analyze,
-        inputs=[audio_input],          # ← no dropdown anymore
+        inputs=[audio_input],
         outputs=[detection_box, recognition_box, explanation_box, summary_box],
     )
 
