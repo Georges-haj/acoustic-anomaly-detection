@@ -99,4 +99,4 @@ def predict_single(audio_path, machine_type, models_dict, reference_stats, thres
                 f"learned normal patterns for {machine_type}."
             ),
         },
-    }
+    }  # ← this closing bracket was missing before
